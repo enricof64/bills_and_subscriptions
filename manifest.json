@@ -1,18 +1,18 @@
 {
   "id": "bills-and-subscriptions",
   "name": "Bills & Subscriptions",
-  "version": "3.6.2",
+  "version": "3.7.0",
   "description": "Track all your bills and subscriptions and see your monthly/yearly spend at a glance",
   "author": "Baykenn",
   "main": "dist/addon.js",
-  "sdkVersion": "3.6.2",
+  "sdkVersion": "3.7.0",
   "license": "MIT",
   "homepage": "https://github.com/Baykenn/bills-and-subscriptions",
   "repository": "https://github.com/Baykenn/bills-and-subscriptions",
   "keywords": ["bills", "subscriptions", "budget", "spending", "tracker"],
-  "minWealthfolioVersion": "3.6.2",
+  "minWealthfolioVersion": "3.7.0",
   "hostDependencies": {
-    "@wealthfolio/addon-sdk": "^3.6.2",
+    "@wealthfolio/addon-sdk": "^3.7.0",
     "react": "^19.2.0",
     "react-dom": "^19.2.0",
     "lucide-react": "^0.561.0"

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { installBrowserGlobals } from "../browser-globals";
-import { LINKS_KEY } from "../../src/lib/storage";
+import { LINKS_KEY, flushWrites, hydrateStorage } from "../../src/lib/storage";
 import {
   confidenceColor,
   getLinkKeys,
@@ -33,10 +33,11 @@ function link(over: Partial<LinkedTransaction> = {}): LinkedTransaction {
 }
 
 describe("link CRUD", () => {
-  it("writes to storage.ts's canonical links key", () => {
+  it("writes to storage.ts's canonical links key", async () => {
     // Not a stylistic point: the v1 -> v2 migration owns "ss:links", so a
     // private key here would silently strand every link.
     saveLink(link());
+    await flushWrites(); // the cache updates synchronously; the host write follows
     expect(JSON.parse(storage.getItem(LINKS_KEY) ?? "null")).toEqual([link()]);
   });
 
@@ -74,10 +75,12 @@ describe("link CRUD", () => {
     expect(getLinks().map((l) => l.entityId)).toEqual(["bill-1"]);
   });
 
-  it("returns [] rather than throwing when the stored value is unusable", () => {
+  it("returns [] rather than throwing when the stored value is unusable", async () => {
     storage.setItem(LINKS_KEY, "{not json");
+    await hydrateStorage();
     expect(getLinks()).toEqual([]);
     storage.setItem(LINKS_KEY, '{"entityId":"sub-1"}'); // object, not array
+    await hydrateStorage();
     expect(getLinks()).toEqual([]);
   });
 });

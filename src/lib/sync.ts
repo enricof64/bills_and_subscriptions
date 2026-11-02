@@ -127,7 +127,7 @@ export async function syncAll(defaultAccountId: string): Promise<SyncResult> {
   try {
     await run(defaultAccountId, tally, errors);
   } catch (err) {
-    // Belt and braces: getContext(), localStorage and the collectors are all
+    // Belt and braces: getContext(), storage and the collectors are all
     // meant to be safe, but a rejection here would reach the UI as nothing.
     errors.push(`Sync stopped: ${describe(err)}`);
   }

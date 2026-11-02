@@ -4,7 +4,7 @@
 // must never define its own key, because the v1 -> v2 migration in storage.ts
 // moves the data there and deletes the legacy pre-v2 key.
 
-import { LINKS_KEY, persist } from "./storage";
+import { LINKS_KEY, persist, readRaw } from "./storage";
 
 // Re-exported so existing importers of this module keep working. New code
 // should import these from "./storage" directly.
@@ -28,7 +28,7 @@ export interface LinkedTransaction {
 
 export function getLinks(): LinkedTransaction[] {
   try {
-    const raw = localStorage.getItem(LINKS_KEY);
+    const raw = readRaw(LINKS_KEY);
     if (!raw) return [];
     const parsed: unknown = JSON.parse(raw);
     return Array.isArray(parsed) ? (parsed as LinkedTransaction[]) : [];
@@ -54,7 +54,7 @@ export function linkKey(entityId: string, activityId: string): string {
 /**
  * "${entityId}|${activityId}" for every link. Build this once per render and
  * test it with linkKey() — isLinked() re-reads and re-parses the whole array on
- * every call, which is O(rows) localStorage hits inside a render loop.
+ * every call, which is O(rows) JSON parses inside a render loop.
  */
 export function getLinkKeys(): Set<string> {
   return new Set(getLinks().map((l) => linkKey(l.entityId, l.activityId)));

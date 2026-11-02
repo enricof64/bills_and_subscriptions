@@ -166,6 +166,15 @@ export function PageLayout({ children, activePath }: PageLayoutProps) {
     };
   }, []);
 
+  useEffect(() => {
+    const onHydrated = () => {
+      setSettings(getSettings());
+      setSyncTotal(getSyncLogCount());
+    };
+    window.addEventListener("ss:storage-hydrated", onHydrated);
+    return () => window.removeEventListener("ss:storage-hydrated", onHydrated);
+  }, []);
+
   const measureTab = useCallback((path: string) => {
     const container = navRef.current;
     if (!container) return null;
@@ -468,7 +477,7 @@ export function PageLayout({ children, activePath }: PageLayoutProps) {
                 )}
               </div>
 
-              {/* Backup — localStorage is the only copy of this data. */}
+              {/* Backup — an export is the only copy of this data that lives outside Wealthfolio. */}
               <div className="flex flex-col gap-2 py-2 border-t border-border">
                 <div className="flex flex-col gap-0.5">
                   <span className="text-sm text-foreground">Backup</span>

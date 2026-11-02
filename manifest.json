@@ -1,55 +1,144 @@
 {
   "id": "bills-and-subscriptions",
   "name": "Bills & Subscriptions",
-  "version": "1.0.0",
+  "version": "3.8.0",
   "description": "Track all your bills and subscriptions and see your monthly/yearly spend at a glance",
   "author": "Baykenn",
   "main": "dist/addon.js",
-  "sdkVersion": "3.3.0",
+  "sdkVersion": "3.8.0",
   "license": "MIT",
   "homepage": "https://github.com/Baykenn/bills-and-subscriptions",
   "repository": "https://github.com/Baykenn/bills-and-subscriptions",
-  "keywords": ["bills", "subscriptions", "budget", "spending", "tracker"],
+  "keywords": [
+    "bills",
+    "subscriptions",
+    "budget",
+    "spending",
+    "tracker"
+  ],
+  "minWealthfolioVersion": "3.8.0",
+  "hostDependencies": {
+    "@wealthfolio/addon-sdk": "^3.8.0",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "lucide-react": "^0.561.0"
+  },
+  "icon": null,
   "enabled": true,
   "permissions": [
     {
+      "category": "ui",
+      "functions": [
+        {
+          "name": "sidebar.addItem",
+          "isDeclared": true,
+          "isDetected": false,
+          "detectedAt": null
+        },
+        {
+          "name": "router.add",
+          "isDeclared": true,
+          "isDetected": false,
+          "detectedAt": null
+        },
+        {
+          "name": "navigation.navigate",
+          "isDeclared": true,
+          "isDetected": false,
+          "detectedAt": null
+        },
+        {
+          "name": "onDisable",
+          "isDeclared": true,
+          "isDetected": false,
+          "detectedAt": null
+        }
+      ],
+      "purpose": "Add Bills & Subscriptions to the sidebar navigation, register its pages and switch between its tabs"
+    },
+    {
       "category": "accounts",
       "functions": [
-        { "name": "getAll", "isDeclared": true, "isDetected": false, "detectedAt": null }
+        {
+          "name": "getAll",
+          "isDeclared": true,
+          "isDetected": false,
+          "detectedAt": null
+        }
       ],
       "purpose": "List your accounts so you can choose which cash account a bill or subscription is charged to, and which accounts to scan for matching transactions. Read-only — the addon never creates or modifies accounts."
     },
     {
       "category": "activities",
       "functions": [
-        { "name": "getAll", "isDeclared": true, "isDetected": false, "detectedAt": null },
-        { "name": "search", "isDeclared": true, "isDetected": false, "detectedAt": null },
-        { "name": "create", "isDeclared": true, "isDetected": false, "detectedAt": null },
-        { "name": "saveMany", "isDeclared": true, "isDetected": false, "detectedAt": null }
+        {
+          "name": "getAll",
+          "isDeclared": true,
+          "isDetected": false,
+          "detectedAt": null
+        },
+        {
+          "name": "search",
+          "isDeclared": true,
+          "isDetected": false,
+          "detectedAt": null
+        },
+        {
+          "name": "create",
+          "isDeclared": true,
+          "isDetected": false,
+          "detectedAt": null
+        },
+        {
+          "name": "saveMany",
+          "isDeclared": true,
+          "isDetected": false,
+          "detectedAt": null
+        }
       ],
       "purpose": "Read transactions on the accounts you select, to detect recurring charges and match each bill or subscription against the real bank movement that paid it. Also writes withdrawal activities when you enable Wealthfolio Sync, so tracked charges appear in your portfolio; writes only target the account you pick and are idempotent."
     },
     {
       "category": "settings",
       "functions": [
-        { "name": "get", "isDeclared": true, "isDetected": false, "detectedAt": null }
+        {
+          "name": "get",
+          "isDeclared": true,
+          "isDetected": false,
+          "detectedAt": null
+        }
       ],
       "purpose": "Read your base currency so monthly and yearly totals are displayed in the same currency as the rest of Wealthfolio. Read-only — no application settings are changed."
     },
     {
       "category": "files",
       "functions": [
-        { "name": "openSaveDialog", "isDeclared": true, "isDetected": false, "detectedAt": null }
+        {
+          "name": "openSaveDialog",
+          "isDeclared": true,
+          "isDetected": false,
+          "detectedAt": null
+        }
       ],
       "purpose": "Open the system save dialog when you export your bills and subscriptions, so you choose where the file is written. The addon cannot read or write files anywhere else."
     },
     {
-      "category": "ui",
+      "category": "secrets",
       "functions": [
-        { "name": "sidebar.addItem", "isDeclared": true, "isDetected": false, "detectedAt": null },
-        { "name": "router.add", "isDeclared": true, "isDetected": false, "detectedAt": null }
+        {
+          "name": "get",
+          "isDeclared": true,
+          "isDetected": false,
+          "detectedAt": null
+        },
+        {
+          "name": "delete",
+          "isDeclared": true,
+          "isDetected": false,
+          "detectedAt": null
+        }
       ],
-      "purpose": "Add Bills & Subscriptions to the sidebar navigation and register its pages"
+      "purpose": "One-time migration of subscriptions, bills, and settings from the legacy secrets-backed store into durable KV storage"
     }
   ]
 }

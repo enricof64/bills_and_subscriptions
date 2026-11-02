@@ -1,11 +1,14 @@
-// localStorage-based persistence for subscriptions.
-// Keys are prefixed with "ss:" to avoid collisions with other addons.
+// Persistence for subscriptions, bills, links and settings, backed by
+// ctx.api.storage — the host's durable per-addon KV store (Wealthfolio 3.6.2+) —
+// through a synchronous in-memory cache (see "Host KV store + in-memory cache").
+// localStorage is not used: it is unavailable in the sandboxed iframe addons run in.
 //
 // Two invariants hold throughout this file:
-//   1. Every write goes through persist() — localStorage can throw
-//      QuotaExceededError and that must never reach a React event handler.
+//   1. Every write goes through persist() — a rejected host write must be
+//      reported and rolled back, never thrown into a React event handler.
 //   2. Every date is a "YYYY-MM-DD" string and all arithmetic/formatting is
 //      UTC-only. Mixing UTC parsing with local rendering shifts dates by a day.
+import { getContext } from "../context";
 
 export type BillingCycle = "monthly" | "yearly" | "quarterly" | "weekly";
 
@@ -115,16 +118,44 @@ export interface Bill {
 }
 
 // ─── Storage keys ─────────────────────────────────────────────────────────────
+// Dotted names match the keys the upstream addon already writes to ctx.api.storage
+// (so an install that predates this fork's extras keeps its data); the storage
+// API accepts only ASCII letters, digits, '.', '_', ':' and '-'.
 
-const BILLS_KEY = "ss:bills";
-const SUBS_KEY = "ss:subscriptions";
-const SETTINGS_KEY = "ss:settings";
-const SYNC_LOG_KEY = "ss:sync-log";
-const SCHEMA_VERSION_KEY = "ss:schema-version";
+const SUBS_KEY = "ss.subscriptions";
+const BILLS_KEY = "ss.bills";
+const SETTINGS_KEY = "ss.settings";
+const SYNC_LOG_KEY = "ss.synclog";
+const SCHEMA_VERSION_KEY = "ss.schema-version";
 /** Canonical key for linked transactions. Import this instead of hardcoding. */
-export const LINKS_KEY = "ss:links";
-/** Pre-v2 key that predates the ss: prefix convention. */
+export const LINKS_KEY = "ss.links";
+/** Pre-v2 key that predates the ss prefix convention. */
 const LEGACY_LINKS_KEY = "blink:links";
+
+const SECRETS_MIGRATION_MARKER_KEY = "ss.migrated.storage-api";
+const LOCALSTORAGE_MIGRATION_MARKER_KEY = "ss.migrated.localstorage";
+
+/** Every key the in-memory cache mirrors. Logos are cached separately. */
+const CACHED_KEYS = [
+  SUBS_KEY,
+  BILLS_KEY,
+  SETTINGS_KEY,
+  SYNC_LOG_KEY,
+  SCHEMA_VERSION_KEY,
+  LINKS_KEY,
+  LEGACY_LINKS_KEY,
+] as const;
+
+/** Where this fork kept each key while it was localStorage-backed (pre-3.6 hosts). */
+const LOCALSTORAGE_KEYS: ReadonlyArray<readonly [string, string]> = [
+  ["ss:subscriptions", SUBS_KEY],
+  ["ss:bills", BILLS_KEY],
+  ["ss:settings", SETTINGS_KEY],
+  ["ss:sync-log", SYNC_LOG_KEY],
+  ["ss:schema-version", SCHEMA_VERSION_KEY],
+  ["ss:links", LINKS_KEY],
+  ["blink:links", LEGACY_LINKS_KEY],
+];
 
 // ─── Storage error reporting ──────────────────────────────────────────────────
 
@@ -149,7 +180,7 @@ export function reportStorageError(err: unknown, key: string): void {
 // ─── Change notification ──────────────────────────────────────────────────────
 
 /**
- * Pages read their slice of localStorage on mount, so a write made on one tab
+ * Pages read their slice of the cache on mount, so a write made on one tab
  * left every other tab stale until it happened to remount — a link created on
  * the Bills page was missing from the Links page, and vice versa. Every write
  * goes through persist(), so one dispatch there covers all of them.
@@ -168,15 +199,7 @@ export function onDataChanged(fn: (key: string) => void, keys?: readonly string[
   return () => window.removeEventListener(DATA_CHANGED_EVENT, handler);
 }
 
-/** The single write path for every module that owns an "ss:" key. Serialises,
- *  catches quota/serialisation failures, reports them, and never throws. */
-export function persist(key: string, value: unknown): void {
-  try {
-    localStorage.setItem(key, JSON.stringify(value));
-  } catch (err) {
-    reportStorageError(err, key);
-    return; // Nothing changed, so do not tell listeners it did.
-  }
+function notifyChanged(key: string): void {
   try {
     window.dispatchEvent(new CustomEvent(DATA_CHANGED_EVENT, { detail: { key } }));
   } catch {
@@ -184,20 +207,110 @@ export function persist(key: string, value: unknown): void {
   }
 }
 
-function forget(key: string): void {
+// ─── Host KV store + in-memory cache ──────────────────────────────────────────
+// ctx.api.storage is async, but the rest of the addon (and every render) reads
+// synchronously. So reads come from an in-memory cache that hydrateStorage()
+// fills once, and writes update the cache immediately and are written through to
+// the host in order. Each collection is one JSON blob (the store caps values at
+// ~250 KB, comfortably above this addon's data).
+
+let hydrated = false;
+const cache = new Map<string, string>();
+
+/**
+ * True once hydrateStorage() has loaded the KV store into the cache. A write
+ * before this point would be built on an empty cache and could overwrite what is
+ * on disk with an incomplete snapshot — pages must gate mutations (e.g. disable
+ * "Add") on this.
+ */
+export function isHydrated(): boolean {
+  return hydrated;
+}
+
+// Writes are serialised so two never land out of order and clobber each other
+// with a stale snapshot (each write sends the whole current blob).
+let writeQueue: Promise<unknown> = Promise.resolve();
+
+function enqueueWrite<T>(op: () => Promise<T>): Promise<T> {
+  const result = writeQueue.then(op, op);
+  writeQueue = result.then(
+    () => undefined,
+    () => undefined,
+  );
+  return result;
+}
+
+/** Resolves once every write issued so far has settled (successfully or not). */
+export function flushWrites(): Promise<void> {
+  return writeQueue.then(() => undefined);
+}
+
+function sanitizeKeySegment(raw: string): string {
+  return raw.replace(/[^A-Za-z0-9._:-]/g, "_");
+}
+
+function storageGet(key: string): Promise<string | null> {
+  return getContext().api.storage.get(key);
+}
+
+function storageSet(key: string, value: string): Promise<void> {
+  return enqueueWrite(() => getContext().api.storage.set(key, value));
+}
+
+function storageDelete(key: string): Promise<void> {
+  return enqueueWrite(() => getContext().api.storage.delete(key));
+}
+
+async function readJson<T>(key: string, fallback: T): Promise<T> {
   try {
-    localStorage.removeItem(key);
-  } catch (err) {
-    reportStorageError(err, key);
+    const raw = await storageGet(key);
+    return raw ? (JSON.parse(raw) as T) : fallback;
+  } catch (err: unknown) {
+    getContext().api.logger.error(`Failed to read "${key}": ${String(err)}`);
+    return fallback;
   }
 }
 
-function readRaw(key: string): string | null {
+function writeJson(key: string, value: unknown): void {
+  storageSet(key, JSON.stringify(value)).catch((err: unknown) => {
+    getContext().api.logger.error(`Failed to persist "${key}": ${String(err)}`);
+  });
+}
+
+/** The single write path for every module that owns an "ss." key. Serialises,
+ *  updates the cache, writes through to the host, reports failures, never throws. */
+export function persist(key: string, value: unknown): void {
+  let raw: string;
   try {
-    return localStorage.getItem(key);
-  } catch {
-    return null;
+    raw = JSON.stringify(value);
+  } catch (err) {
+    reportStorageError(err, key);
+    return; // Nothing changed, so do not tell listeners it did.
   }
+  const previous = cache.get(key);
+  cache.set(key, raw);
+  notifyChanged(key);
+  storageSet(key, raw).catch((err: unknown) => {
+    // The host refused the write (quota, size cap, store unavailable). Roll the
+    // cache back so the UI does not show data that will vanish on reload — but
+    // only if nothing newer has been written to this key in the meantime.
+    if (cache.get(key) === raw) {
+      if (previous === undefined) cache.delete(key);
+      else cache.set(key, previous);
+      notifyChanged(key);
+    }
+    reportStorageError(err, key);
+  });
+}
+
+function forget(key: string): void {
+  cache.delete(key);
+  storageDelete(key).catch((err: unknown) => reportStorageError(err, key));
+}
+
+/** Raw cached JSON for a key, or null. Never throws. */
+export function readRaw(key: string): string | null {
+  return cache.get(key) ?? null;
 }
 
 function load<T>(key: string): T[] {
@@ -214,6 +327,298 @@ function load<T>(key: string): T[] {
 function save<T>(key: string, items: T[]): void {
   persist(key, items);
 }
+
+let subLogoCache: Record<string, string> = {};
+let subLogoIds: string[] = [];
+let billLogoCache: Record<string, string> = {};
+let billLogoIds: string[] = [];
+
+/**
+ * Load everything from the host KV store into the cache, run schema migrations
+ * on the loaded data, then announce "ss:storage-hydrated". Safe to call again
+ * (it replaces the cache wholesale). Never throws: a failed read leaves that
+ * collection empty and is logged.
+ */
+export async function hydrateStorage(): Promise<void> {
+  try {
+    await migrateLegacySecretsIfNeeded();
+    await migrateLocalStorageIfNeeded();
+  } catch (err: unknown) {
+    getContext().api.logger.error(`Legacy data migration failed: ${String(err)}`);
+  }
+
+  const [rawEntries, subLogos, billLogos] = await Promise.all([
+    Promise.all(
+      CACHED_KEYS.map(async (key) => {
+        try {
+          return [key, await storageGet(key)] as const;
+        } catch (err: unknown) {
+          getContext().api.logger.error(`Failed to read "${key}": ${String(err)}`);
+          return [key, null] as const;
+        }
+      }),
+    ),
+    loadLogos("sub"),
+    loadLogos("bill"),
+  ]);
+
+  cache.clear();
+  for (const [key, raw] of rawEntries) {
+    if (raw !== null) cache.set(key, raw);
+  }
+  subLogoCache = subLogos.cache;
+  subLogoIds = subLogos.ids;
+  billLogoCache = billLogos.cache;
+  billLogoIds = billLogos.ids;
+
+  runMigrations();
+  hydrated = true;
+  window.dispatchEvent(new CustomEvent("ss:storage-hydrated"));
+}
+
+// ─── Fork localStorage -> KV migration ────────────────────────────────────────
+// Before this addon moved to ctx.api.storage it kept everything in localStorage
+// under "ss:*". Hosts that still expose localStorage to addons hand that data
+// to the KV store exactly once; sandboxed hosts (3.6+) have none and skip it.
+
+async function migrateLocalStorageIfNeeded(): Promise<void> {
+  const marker = await storageGet(LOCALSTORAGE_MIGRATION_MARKER_KEY).catch(() => null);
+  if (marker) return;
+
+  let ls: Storage | null = null;
+  try {
+    ls = typeof localStorage === "undefined" ? null : localStorage;
+  } catch {
+    ls = null; // accessing it throws in sandboxed iframes
+  }
+
+  if (ls) {
+    for (const [lsKey, kvKey] of LOCALSTORAGE_KEYS) {
+      let raw: string | null = null;
+      try {
+        raw = ls.getItem(lsKey);
+      } catch {
+        continue;
+      }
+      if (raw === null) continue;
+      // Never overwrite data that already lives in the KV store.
+      const existing = await storageGet(kvKey).catch(() => null);
+      if (existing === null) await storageSet(kvKey, raw);
+    }
+  }
+
+  await storageSet(LOCALSTORAGE_MIGRATION_MARKER_KEY, "1");
+}
+
+// ─── Legacy secrets migration ─────────────────────────────────────────────────
+// Wealthfolio versions before 3.6.2 gave addons no durable storage other than
+// ctx.api.secrets (OS keyring-backed, capped at 2560 chars/value), so the addon
+// split each collection into one secret per item plus an index, and chunked
+// logos into ~1000-char pieces. This one-time pass reads any pre-3.6.2 data out
+// of secrets, writes it into the new storage keys, and deletes the old secrets
+// so they don't linger in the keyring. Gated by a marker key.
+
+function itemKey(prefix: string, id: string): string {
+  return `ss.${prefix}.${sanitizeKeySegment(id)}`;
+}
+
+function indexKey(prefix: string): string {
+  return `ss.${prefix}.index`;
+}
+
+async function loadLegacyCollection<T>(
+  secrets: { get(key: string): Promise<string | null> },
+  prefix: string,
+): Promise<{ items: T[]; ids: string[] }> {
+  try {
+    const indexRaw = await secrets.get(indexKey(prefix));
+    const ids: string[] = indexRaw ? JSON.parse(indexRaw) : [];
+    const items: (T | null)[] = await Promise.all(
+      ids.map(async (id): Promise<T | null> => {
+        try {
+          const raw = await secrets.get(itemKey(prefix, id));
+          return raw ? (JSON.parse(raw) as T) : null;
+        } catch {
+          return null;
+        }
+      }),
+    );
+    return { items: items.filter((item): item is T => item !== null), ids };
+  } catch {
+    return { items: [], ids: [] };
+  }
+}
+
+async function loadLegacyChunkedValue(
+  secrets: { get(key: string): Promise<string | null> },
+  prefix: string,
+  id: string,
+): Promise<{ value: string | null; chunkCount: number }> {
+  try {
+    const metaRaw = await secrets.get(itemKey(prefix, id));
+    if (!metaRaw) return { value: null, chunkCount: 0 };
+    const meta = JSON.parse(metaRaw) as { chunks: number };
+    const chunks = await Promise.all(
+      Array.from({ length: meta.chunks }, (_, i) => secrets.get(`${itemKey(prefix, id)}.c${i}`)),
+    );
+    if (chunks.some((c) => c === null)) return { value: null, chunkCount: meta.chunks };
+    return { value: chunks.join(""), chunkCount: meta.chunks };
+  } catch {
+    return { value: null, chunkCount: 0 };
+  }
+}
+
+async function loadLegacyLogos(
+  secrets: { get(key: string): Promise<string | null> },
+  prefix: string,
+): Promise<{ cache: Record<string, string>; chunkCounts: Record<string, number> }> {
+  const indexRaw = await secrets.get(indexKey(prefix)).catch(() => null);
+  const ids: string[] = indexRaw ? JSON.parse(indexRaw) : [];
+  const loaded = await Promise.all(ids.map((id) => loadLegacyChunkedValue(secrets, prefix, id)));
+  const cache: Record<string, string> = {};
+  const chunkCounts: Record<string, number> = {};
+  ids.forEach((id, i) => {
+    if (loaded[i].value !== null) cache[id] = loaded[i].value as string;
+    chunkCounts[id] = loaded[i].chunkCount;
+  });
+  return { cache, chunkCounts };
+}
+
+async function migrateLegacySecretsIfNeeded(): Promise<void> {
+  const marker = await storageGet(SECRETS_MIGRATION_MARKER_KEY).catch(() => null);
+  if (marker) return;
+
+  const secrets = getContext().api.secrets;
+
+  const [subs, bills, syncLog, settingsRaw, subLogos, billLogos] = await Promise.all([
+    loadLegacyCollection<Subscription>(secrets, "sub"),
+    loadLegacyCollection<Bill>(secrets, "bill"),
+    loadLegacyCollection<string>(secrets, "synclog"),
+    secrets.get(SETTINGS_KEY).catch(() => null),
+    loadLegacyLogos(secrets, "logo-sub"),
+    loadLegacyLogos(secrets, "logo-bill"),
+  ]);
+
+  const subLogoIdsFound = Object.keys(subLogos.cache);
+  const billLogoIdsFound = Object.keys(billLogos.cache);
+  const foundLegacyData =
+    subs.items.length > 0 ||
+    bills.items.length > 0 ||
+    syncLog.items.length > 0 ||
+    !!settingsRaw ||
+    subLogoIdsFound.length > 0 ||
+    billLogoIdsFound.length > 0;
+
+  if (foundLegacyData) {
+    const syncLogEntries = Object.fromEntries(
+      syncLog.ids.map((id, i) => [id, syncLog.items[i]]).filter(([, v]) => v !== undefined),
+    );
+    await Promise.all([
+      storageSet(SUBS_KEY, JSON.stringify(subs.items)),
+      storageSet(BILLS_KEY, JSON.stringify(bills.items)),
+      storageSet(SYNC_LOG_KEY, JSON.stringify(syncLogEntries)),
+      settingsRaw ? storageSet(SETTINGS_KEY, settingsRaw) : Promise.resolve(),
+      ...subLogoIdsFound.map((id) => storageSet(itemKey("logo.sub", id), subLogos.cache[id])),
+      subLogoIdsFound.length ? storageSet(indexKey("logo.sub"), JSON.stringify(subLogoIdsFound)) : Promise.resolve(),
+      ...billLogoIdsFound.map((id) => storageSet(itemKey("logo.bill", id), billLogos.cache[id])),
+      billLogoIdsFound.length ? storageSet(indexKey("logo.bill"), JSON.stringify(billLogoIdsFound)) : Promise.resolve(),
+    ]);
+
+    const legacyKeysToDelete = [
+      SETTINGS_KEY,
+      indexKey("sub"), ...subs.ids.map((id) => itemKey("sub", id)),
+      indexKey("bill"), ...bills.ids.map((id) => itemKey("bill", id)),
+      indexKey("synclog"), ...syncLog.ids.map((id) => itemKey("synclog", id)),
+      indexKey("logo-sub"),
+      ...Object.keys(subLogos.chunkCounts).flatMap((id) =>
+        Array.from({ length: subLogos.chunkCounts[id] }, (_, i) => `${itemKey("logo-sub", id)}.c${i}`).concat(
+          itemKey("logo-sub", id),
+        ),
+      ),
+      indexKey("logo-bill"),
+      ...Object.keys(billLogos.chunkCounts).flatMap((id) =>
+        Array.from({ length: billLogos.chunkCounts[id] }, (_, i) => `${itemKey("logo-bill", id)}.c${i}`).concat(
+          itemKey("logo-bill", id),
+        ),
+      ),
+    ];
+    await Promise.all(legacyKeysToDelete.map((key) => secrets.delete(key).catch(() => {})));
+    getContext().api.logger.info(
+      `Migrated legacy secrets-backed data to storage API: ${subs.items.length} subscriptions, ${bills.items.length} bills`,
+    );
+  }
+
+  await storageSet(SECRETS_MIGRATION_MARKER_KEY, "1");
+}
+
+// ─── Logos ────────────────────────────────────────────────────────────────────
+// Keyed individually rather than folded into one blob, since they're looked
+// up by subscription/bill id and added/removed independently. An index lists
+// the ids that currently have a logo, since the storage API has no key
+// listing/enumeration of its own.
+
+export type LogoKind = "sub" | "bill";
+
+function logoPrefix(kind: LogoKind): string {
+  return kind === "sub" ? "logo.sub" : "logo.bill";
+}
+
+async function loadLogos(kind: LogoKind): Promise<{ cache: Record<string, string>; ids: string[] }> {
+  const prefix = logoPrefix(kind);
+  const ids = await readJson<string[]>(indexKey(prefix), []);
+  const values = await Promise.all(ids.map((id) => storageGet(itemKey(prefix, id))));
+  const cache = Object.fromEntries(
+    ids.map((id, i) => [id, values[i]]).filter((entry): entry is [string, string] => entry[1] !== null),
+  );
+  return { cache, ids: Object.keys(cache) };
+}
+
+export function getLogo(kind: LogoKind, id: string): string | null {
+  return (kind === "sub" ? subLogoCache : billLogoCache)[id] ?? null;
+}
+
+/** Returns true if the logo was saved successfully. */
+export async function saveLogo(kind: LogoKind, id: string, dataUri: string): Promise<boolean> {
+  const prefix = logoPrefix(kind);
+  try {
+    await storageSet(itemKey(prefix, id), dataUri);
+  } catch (err: unknown) {
+    getContext().api.logger.error(`Failed to persist logo ${prefix}/${id}: ${String(err)}`);
+    getContext().api.toast.error("Couldn't save that logo — it may still be too large. Try a smaller image.");
+    return false;
+  }
+  if (kind === "sub") {
+    subLogoCache = { ...subLogoCache, [id]: dataUri };
+    if (!subLogoIds.includes(id)) {
+      subLogoIds = [id, ...subLogoIds];
+      writeJson(indexKey(prefix), subLogoIds);
+    }
+  } else {
+    billLogoCache = { ...billLogoCache, [id]: dataUri };
+    if (!billLogoIds.includes(id)) {
+      billLogoIds = [id, ...billLogoIds];
+      writeJson(indexKey(prefix), billLogoIds);
+    }
+  }
+  return true;
+}
+
+export function deleteLogo(kind: LogoKind, id: string): void {
+  const prefix = logoPrefix(kind);
+  storageDelete(itemKey(prefix, id)).catch(() => {});
+  if (kind === "sub") {
+    const { [id]: _removed, ...rest } = subLogoCache;
+    subLogoCache = rest;
+    subLogoIds = subLogoIds.filter((existing) => existing !== id);
+    writeJson(indexKey(prefix), subLogoIds);
+  } else {
+    const { [id]: _removed, ...rest } = billLogoCache;
+    billLogoCache = rest;
+    billLogoIds = billLogoIds.filter((existing) => existing !== id);
+    writeJson(indexKey(prefix), billLogoIds);
+  }
+}
+
 
 // ─── Bills store ──────────────────────────────────────────────────────────────
 
@@ -326,7 +731,7 @@ export function toYearly(amount: number, cycle: BillingCycle): number {
  * rows carry whatever currency the host had on the activity, and a restored
  * backup is only validated structurally. This is called from render bodies, so a
  * throw would blank the whole page — including the buttons needed to delete the
- * offending row — leaving the addon unusable until localStorage is cleared by
+ * offending row — leaving the addon unusable until its stored data is cleared by
  * hand. Falls back to "12.30 US$" rather than dying.
  */
 export function formatCurrency(amount: number, currency: string): string {

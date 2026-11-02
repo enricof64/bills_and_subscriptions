@@ -225,7 +225,7 @@ export function SuggestionsPage() {
     const subs = getSubscriptions().filter(s => s.active);
     setSubscriptions(subs);
 
-    // Init linkSets from localStorage
+    // Init linkSets from stored links
     const initial: Record<string, Set<string>> = {};
     for (const sub of subs) {
       const links = getLinksForEntity(sub.id);
